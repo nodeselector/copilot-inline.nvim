@@ -17,6 +17,7 @@ local stdout_buf = "" -- incremental line buffer for partial reads
 local comment_lines = {} -- comment_id → { bufnr, line }
 local stored_replies = {} -- comment_id → display string
 local stored_comments = {} -- comment_id → { file, line, text, reply }
+local last_sent_comment_id = nil -- for error correlation
 
 -- ──────────────────────────── config ────────────────────────────
 
@@ -45,10 +46,18 @@ end
 local function send(msg)
   if not bridge_job then
     vim.notify("[copilot-inline] not connected", vim.log.levels.WARN)
-    return
+    return false
   end
   local json = vim.json.encode(msg)
-  vim.fn.chansend(bridge_job, json .. "\n")
+  local ok = vim.fn.chansend(bridge_job, json .. "\n")
+  if ok == 0 then
+    vim.notify("[copilot-inline] bridge dead, reconnecting…", vim.log.levels.WARN)
+    bridge_job = nil
+    connected = false
+    vim.schedule(function() M.connect() end)
+    return false
+  end
+  return true
 end
 
 local function on_stdout(_, data, _)
@@ -161,6 +170,20 @@ function M._handle_message(msg)
     return
   end
 
+  -- App-side error (e.g. send_message failed because session is dead)
+  if t == "error" then
+    local err_msg = msg.message or "unknown error"
+    local err_sid = msg.session_id
+    vim.schedule(function()
+      vim.notify("[copilot-inline] ❌ " .. err_msg, vim.log.levels.ERROR)
+      -- If error references our session, mark pending comments as failed
+      if err_sid and err_sid == session_id then
+        M._mark_last_comment_failed()
+      end
+    end)
+    return
+  end
+
   if t == "workspace_list" then
     workspaces = msg.workspaces or {}
     vim.schedule(function() M._resolve_workspace() end)
@@ -186,6 +209,20 @@ function M._handle_message(msg)
 
   if t == "inline_review_comments" then
     vim.schedule(function() M._hydrate_from_ws(msg.comments or {}) end)
+    return
+  end
+
+  -- Session lifecycle — re-resolve when sessions start/stop so session_id stays fresh
+  if t == "session_started" or t == "session_stopped" or t == "session_removed" then
+    local sid = msg.session_id or msg.sessionId
+    if sid and sid == session_id and t ~= "session_started" then
+      -- Our session died — clear stale id and re-resolve
+      vim.schedule(function()
+        vim.notify("[copilot-inline] session ended, re-resolving…", vim.log.levels.WARN)
+        session_id = nil
+        send({ type = "list_workspaces" })
+      end)
+    end
     return
   end
 end
@@ -483,6 +520,18 @@ function M._open_comment_editor(line_start, line_end)
   vim.cmd("startinsert")
 end
 
+--- Update the last sent comment's extmark to show a failure indicator.
+function M._mark_last_comment_failed()
+  local cid = last_sent_comment_id
+  if not cid then return end
+  local cl = comment_lines[cid]
+  if not cl or not vim.api.nvim_buf_is_valid(cl.bufnr) then return end
+  vim.api.nvim_buf_set_extmark(cl.bufnr, ns, cl.line, 0, {
+    virt_text = { { " ❌ send failed", "DiagnosticError" } },
+    virt_text_pos = "eol",
+  })
+end
+
 --- Internal: send a comment (shared by both inline text and editor paths).
 function M._send_comment(bufnr, filepath, rel_path, line_start, line_end, text)
   local comment_id = "nvim-" .. uuid()
@@ -490,7 +539,7 @@ function M._send_comment(bufnr, filepath, rel_path, line_start, line_end, text)
   local thread_token = "nvim:" .. resolved_ws.id .. ":" .. uuid()
   local now = os.date("!%Y-%m-%dT%H:%M:%S.000Z")
 
-  send({
+  local ok1 = send({
     type = "save_inline_review_comment",
     comment = {
       id = comment_id,
@@ -508,24 +557,34 @@ function M._send_comment(bufnr, filepath, rel_path, line_start, line_end, text)
     },
   })
 
+  if not ok1 then
+    vim.notify("[copilot-inline] ❌ failed to save comment (bridge dead)", vim.log.levels.ERROR)
+    return
+  end
+
   local diff_context = get_diff_context(filepath, line_start, line_end)
   local prompt = build_review_prompt(
     comment_id, thread_id, thread_token, comment_id,
     rel_path, line_start, line_end, text, diff_context, resolved_ws.id
   )
 
-  send({
+  local ok2 = send({
     type = "send_message",
     session_id = session_id,
     prompt = prompt,
     mode = "enqueue",
   })
 
+  local mark_text = ok2
+    and { { " 💬 sent", "DiagnosticInfo" } }
+    or { { " ⚠️ saved but send failed", "DiagnosticWarn" } }
+
   vim.api.nvim_buf_set_extmark(bufnr, ns, line_start - 1, 0, {
-    virt_text = { { " 💬 sent", "DiagnosticInfo" } },
+    virt_text = mark_text,
     virt_text_pos = "eol",
   })
 
+  last_sent_comment_id = comment_id
   comment_lines[comment_id] = { bufnr = bufnr, line = line_start - 1 }
   stored_comments[comment_id] = {
     file = rel_path,
