@@ -30,3 +30,7 @@ end, { desc = "View comment thread on current line" })
 vim.api.nvim_create_user_command("CopilotComments", function()
   require("copilot-inline").list_comments()
 end, { desc = "List all inline comments in quickfix" })
+
+vim.api.nvim_create_user_command("CopilotResend", function()
+  require("copilot-inline").resend()
+end, { desc = "Re-send unreplied comments to current session" })

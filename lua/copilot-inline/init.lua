@@ -215,7 +215,15 @@ function M._handle_message(msg)
   -- Session lifecycle — re-resolve when sessions start/stop so session_id stays fresh
   if t == "session_started" or t == "session_stopped" or t == "session_removed" then
     local sid = msg.session_id or msg.sessionId
-    if sid and sid == session_id and t ~= "session_started" then
+    if t == "session_started" then
+      -- A new session started — re-resolve to pick up resumed/new sessions for our workspace
+      vim.schedule(function()
+        local old_sid = session_id
+        send({ type = "list_workspaces" })
+        -- After re-resolve completes (async), _resolve_workspace will update session_id.
+        -- If it changed, we'll log it there.
+      end)
+    elseif sid and sid == session_id then
       -- Our session died — clear stale id and re-resolve
       vim.schedule(function()
         vim.notify("[copilot-inline] session ended, re-resolving…", vim.log.levels.WARN)
@@ -253,6 +261,8 @@ function M._resolve_workspace()
 
   vim.notify("[copilot-inline] workspace: " .. (best.name or best.id), vim.log.levels.INFO)
 
+  local old_session_id = session_id
+
   -- Extract session_id from workspace_list payload (nested Option<Option<>>)
   local s = best.session
   if s then
@@ -264,6 +274,14 @@ function M._resolve_workspace()
 
   -- Hydrate existing comments from the DB
   M._hydrate_comments()
+
+  -- Detect session change (resume scenario) and warn about orphaned comments
+  if old_session_id and session_id and old_session_id ~= session_id then
+    vim.notify(
+      "[copilot-inline] session changed (resume?). Use :CopilotResend to re-deliver unreplied comments.",
+      vim.log.levels.WARN
+    )
+  end
 end
 
 -- ──────────────────────────── helpers (declared early for hydration) ────
@@ -869,6 +887,7 @@ function M.list_comments()
       filename = comment.file,
       lnum = comment.line_start,
       text = status .. " " .. comment.text,
+      comment_id = cid,
     })
   end
 
@@ -885,6 +904,103 @@ function M.list_comments()
   vim.fn.setqflist(items, "r")
   vim.fn.setqflist({}, "a", { title = "Copilot Inline Comments" })
   vim.cmd("copen")
+end
+
+--- Re-send unreplied plugin-authored comments to the current session.
+--- Only resends comments with nvim-* IDs (plugin-authored, not App-UI comments).
+function M.resend()
+  if not resolved_ws then
+    vim.notify("[copilot-inline] not connected to a workspace", vim.log.levels.ERROR)
+    return
+  end
+  if not session_id then
+    vim.notify("[copilot-inline] no active session", vim.log.levels.ERROR)
+    return
+  end
+
+  local candidates = {}
+  for cid, comment in pairs(stored_comments) do
+    -- Only resend plugin-authored comments (nvim-* prefix) that have no reply
+    if vim.startswith(cid, "nvim-") and not stored_replies[cid] then
+      table.insert(candidates, { id = cid, comment = comment })
+    end
+  end
+
+  if #candidates == 0 then
+    vim.notify("[copilot-inline] no unreplied plugin comments to resend", vim.log.levels.INFO)
+    return
+  end
+
+  table.sort(candidates, function(a, b)
+    if a.comment.file ~= b.comment.file then return a.comment.file < b.comment.file end
+    return a.comment.line_start < b.comment.line_start
+  end)
+
+  local descriptions = {}
+  for _, c in ipairs(candidates) do
+    table.insert(descriptions, string.format("  %s:%d — %s",
+      c.comment.file, c.comment.line_start,
+      c.comment.text:sub(1, 60) .. (#c.comment.text > 60 and "…" or "")
+    ))
+  end
+
+  vim.ui.select(
+    { "Resend all (" .. #candidates .. ")", "Cancel" },
+    {
+      prompt = "Re-deliver unreplied comments to current session?\n" .. table.concat(descriptions, "\n") .. "\n",
+    },
+    function(choice)
+      if not choice or choice:match("^Cancel") then return end
+
+      local sent = 0
+      for _, c in ipairs(candidates) do
+        local cid = c.id
+        local comment = c.comment
+        local thread_id = "thread:" .. cid
+        -- Reuse original thread_token if available, otherwise generate new
+        local thread_token = "nvim:" .. resolved_ws.id .. ":" .. uuid()
+
+        -- Find the file on disk to get diff context
+        local filepath = nil
+        local git_root = vim.fn.systemlist("git rev-parse --show-toplevel")[1] or ""
+        if git_root ~= "" then
+          filepath = git_root .. "/" .. comment.file
+        end
+
+        local diff_context = filepath and get_diff_context(filepath, comment.line_start, comment.line_end) or ""
+        local prompt = build_review_prompt(
+          cid, thread_id, thread_token, cid,
+          comment.file, comment.line_start, comment.line_end,
+          comment.text, diff_context, resolved_ws.id
+        )
+
+        local ok = send({
+          type = "send_message",
+          session_id = session_id,
+          prompt = prompt,
+          mode = "enqueue",
+        })
+
+        if ok then
+          sent = sent + 1
+          -- Update extmark if we have one
+          local cl = comment_lines[cid]
+          if cl and vim.api.nvim_buf_is_valid(cl.bufnr) then
+            vim.api.nvim_buf_set_extmark(cl.bufnr, ns, cl.line, 0, {
+              virt_text = { { " 💬 resent", "DiagnosticInfo" } },
+              virt_text_pos = "eol",
+            })
+          end
+        end
+      end
+
+      vim.notify(
+        string.format("[copilot-inline] resent %d/%d comment(s) to session %s",
+          sent, #candidates, (session_id or "?"):sub(1, 8)),
+        vim.log.levels.INFO
+      )
+    end
+  )
 end
 
 function M.debug()
