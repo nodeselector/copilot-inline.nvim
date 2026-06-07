@@ -17,6 +17,7 @@ local stdout_buf = "" -- incremental line buffer for partial reads
 local comment_lines = {} -- comment_id → { bufnr, line }
 local stored_replies = {} -- comment_id → display string
 local stored_comments = {} -- comment_id → { file, line, text, reply }
+local live_replies = {} -- comment_id → true; replies received THIS session lifetime (not DB-hydrated)
 local last_sent_comment_id = nil -- for error correlation
 
 -- ──────────────────────────── config ────────────────────────────
@@ -228,6 +229,7 @@ function M._handle_message(msg)
       vim.schedule(function()
         vim.notify("[copilot-inline] session ended, re-resolving…", vim.log.levels.WARN)
         session_id = nil
+        live_replies = {} -- reset; new session hasn't seen any replies
         send({ type = "list_workspaces" })
       end)
     end
@@ -694,6 +696,7 @@ function M._show_reply(reply)
 
   -- Store for toggle re-render
   stored_replies[comment_id] = display
+  live_replies[comment_id] = true -- track that THIS session lifetime saw the reply
 
   -- Store full reply for thread viewer
   if stored_comments[comment_id] then
@@ -921,7 +924,8 @@ function M.resend()
   local candidates = {}
   for cid, comment in pairs(stored_comments) do
     -- Only resend plugin-authored comments (nvim-* prefix) that have no reply
-    if vim.startswith(cid, "nvim-") and not stored_replies[cid] then
+    -- in THIS session lifetime. DB-hydrated replies from a killed session don't count.
+    if vim.startswith(cid, "nvim-") and not live_replies[cid] then
       table.insert(candidates, { id = cid, comment = comment })
     end
   end
